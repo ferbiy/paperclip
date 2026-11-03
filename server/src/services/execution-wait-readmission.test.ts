@@ -214,6 +214,34 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await queuedRuns(f.companyId)).toHaveLength(1);
   });
 
+  it("re-admits a saved-comment wake once while a 30-second sweep keeps touching it", async () => {
+    const f = await seed();
+    const parked = await park(f);
+    expect(parked.payload?._paperclipWakeContext).toMatchObject({ wakeCommentIds: [f.commentId] });
+    await clearGate(f.sourceRunId);
+    const service = heartbeatService(db);
+    const receipt = async () => (await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, parked.id)))[0];
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const start = Date.now();
+      const tick = async (at: number) => {
+        vi.setSystemTime(at);
+        await Promise.all([service.readmitUnblockedExecutionWaits(), service.readmitUnblockedExecutionWaits()]);
+        await service.resumeQueuedRuns();
+      };
+      await tick(start + 30_000);
+      expect(await receipt()).toMatchObject({ status: "deferred_issue_execution", updatedAt: new Date(start + 30_000) });
+      for (let at = start + 60_000; at <= start + 180_000; at += 30_000) await tick(at);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(await queuedRuns(f.companyId)).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(
+      agentWakeupRequests.idempotencyKey, `execution-wait-readmit:${parked.id}`))).toHaveLength(1);
+    expect((await receipt()).status).toBe("skipped");
+  });
+
   it("limits targeted recovery to the requested company and receipt", async () => {
     const fixtures = await Promise.all([seed(), seed(), seed()]);
     const parked = [];
