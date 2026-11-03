@@ -335,6 +335,11 @@ function runCancellationFenceSql(input: {
  * The gate itself is re-read each pass, so this only avoids needless churn. */
 const READMIT_EXECUTION_WAIT_AFTER_MS = 60_000;
 
+function readmitLeaseExpired() {
+  return sql`coalesce((${agentWakeupRequests.payload} #>> '{executionWait,readmitClaimedAt}')::timestamptz, '-infinity')
+    <= ${new Date(Date.now() - READMIT_EXECUTION_WAIT_AFTER_MS).toISOString()}::timestamptz`;
+}
+
 /** Run control binds cancellation, resource release, and saved-input resumption. */
 export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunControlDependencies) {
   const {
@@ -822,7 +827,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         // receipt. Only a fully released task is reconsidered here.
         isNull(issues.executionRunId),
         notInArray(issues.status, ["done", "cancelled"]),
-        lte(agentWakeupRequests.updatedAt, new Date(Date.now() - READMIT_EXECUTION_WAIT_AFTER_MS)),
+        lte(agentWakeupRequests.requestedAt, new Date(Date.now() - READMIT_EXECUTION_WAIT_AFTER_MS)),
+        readmitLeaseExpired(),
       ))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     const seen = new Set<string>();
@@ -833,18 +839,20 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       const taskKey = `${wake.agentId}:${issueId}`;
       const firstForTask = !seen.has(taskKey);
       seen.add(taskKey);
-      // Claim the receipt by its own age, exactly as `resumeExecutionWaitComments`
-      // does, so a concurrent pass cannot promote the same wake. The claim also
+      // Claim the receipt so a concurrent pass cannot promote the same wake. The claim also
       // advances the scan cursor before the gate is read: a wake whose gate is
       // still up, or a duplicate behind it, moves to the back of the queue
       // instead of holding this bounded window, which spans every company,
       // and starving a later wake whose gate has cleared. The receipt stays
       // held until admission answers: an interrupted server leaves the wake
       // queued for a later pass, never silently retired.
-      const [claimed] = await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+      const claimedAt = new Date();
+      const [claimed] = await db.update(agentWakeupRequests).set({ updatedAt: claimedAt,
+        payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{executionWait,readmitClaimedAt}', to_jsonb(${claimedAt.toISOString()}::text))`,
+      }).where(and(
         eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, wake.companyId),
         eq(agentWakeupRequests.status, "deferred_issue_execution"),
-        lte(agentWakeupRequests.updatedAt, new Date(Date.now() - READMIT_EXECUTION_WAIT_AFTER_MS)),
+        readmitLeaseExpired(),
       )).returning({ id: agentWakeupRequests.id });
       if (!claimed) continue;
       // One re-admission per task per pass: the queued run it produces serves

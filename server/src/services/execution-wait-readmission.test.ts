@@ -67,7 +67,9 @@ const support = await getEmbeddedPostgresTestSupport();
   }
 
   const makeDue = (id: string) => db.update(agentWakeupRequests)
-    .set({ updatedAt: new Date(0) }).where(eq(agentWakeupRequests.id, id));
+    .set({ updatedAt: new Date(0), requestedAt: new Date(0),
+      payload: sql`${agentWakeupRequests.payload} #- '{executionWait,readmitClaimedAt}'` })
+    .where(eq(agentWakeupRequests.id, id));
   const clearGate = (runId: string) => db.update(heartbeatRuns)
     .set({ processPid: 999999999 }).where(eq(heartbeatRuns.id, runId));
   const queuedRuns = (companyId: string) => db.select().from(heartbeatRuns)
@@ -279,14 +281,14 @@ const support = await getEmbeddedPostgresTestSupport();
     const gatedWake = await park(gated);
     const { id: _id, idempotencyKey: _key, ...copy } = gatedWake;
     await db.insert(agentWakeupRequests).values(Array.from({ length: 49 }, () => ({ ...copy })));
-    await db.update(agentWakeupRequests).set({ updatedAt: new Date(0) })
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(0), requestedAt: new Date(0) })
       .where(eq(agentWakeupRequests.companyId, gated.companyId));
 
     // A newer wake in another company, parked behind a gate that has cleared.
     const f = await seed();
     const parked = await park(f);
     await clearGate(f.sourceRunId);
-    await db.update(agentWakeupRequests).set({ updatedAt: new Date(1_000) })
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(1_000), requestedAt: new Date(1_000) })
       .where(eq(agentWakeupRequests.id, parked.id));
 
     // The first pass reads only the gated window. It must move those waits
